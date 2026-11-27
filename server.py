@@ -25,6 +25,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import topics  # noqa: E402  (detecção de temas, ver topics.py)
+
+CUSTOM_PATH = os.path.join(HERE, "topicos.json")  # temas criados por você
 STATIC = os.path.join(HERE, "static")
 MAX_FILE = 300 * 1024 * 1024      # limite por arquivo dentro do zip
 MAX_UPLOAD = 1024 * 1024 * 1024   # limite de upload pela interface
@@ -62,6 +66,7 @@ class Store:
         self.search_text = {}  # id -> (title, texto original, texto "folded")
         self.user_name = ""
         self.errors = []
+        self.analysis = {"chat_cats": {}, "chat_kw": {}}
 
     # -- leitura --------------------------------------------------------
     @staticmethod
@@ -161,6 +166,25 @@ class Store:
             text = "\n".join(chunks)
             title = c.get("title") or ""
             self.search_text[cid] = (title, text, fold(text), fold(title))
+        self.analysis = topics.analyze(self.chats)
+
+    def topics_payload(self):
+        """Grupos de temas (personalizados, categorias e palavras-chave) + temas de cada chat."""
+        custom = topics.custom_groups(topics.load_custom(CUSTOM_PATH), self.search_text)
+        auto = topics.build_groups(self.analysis, list(self.chats))
+        groups = custom + auto
+        chat_topics = {cid: [] for cid in self.chats}
+        for g in groups:
+            if g["kind"] == "keyword":
+                continue
+            for cid in g["chat_ids"]:
+                if cid in chat_topics:
+                    chat_topics[cid].append(g["key"])
+        return {
+            "groups": groups,
+            "chat_topics": chat_topics,
+            "chat_keywords": {cid: kws[:6] for cid, kws in self.analysis["chat_kw"].items()},
+        }
 
     # -- API --------------------------------------------------------------
     def summary(self, cid):
@@ -313,6 +337,9 @@ class Handler(BaseHTTPRequestHandler):
             q = (parse_qs(url.query).get("q") or [""])[0]
             with LOCK:
                 return self._json(STORE.search(q))
+        if path == "/api/topics":
+            with LOCK:
+                return self._json(STORE.topics_payload())
 
         # arquivos estáticos
         if path == "/":
@@ -335,7 +362,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._host_ok():
             return self._json({"error": "forbidden"}, 403)
-        if urlparse(self.path).path != "/api/load":
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost", "::1"):
+            return self._json({"error": "forbidden"}, 403)  # bloqueia POST vindo de outros sites
+        route = urlparse(self.path).path
+        if route == "/api/custom":  # salva a lista completa de temas personalizados
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > 2 * 1024 * 1024:
+                    return self._json({"error": "Requisição inválida."}, 400)
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+                saved = topics.save_custom(CUSTOM_PATH, body.get("topics", []))
+            except (ValueError, OSError) as e:
+                return self._json({"error": "Não consegui salvar: %s" % e}, 400)
+            return self._json({"ok": True, "count": len(saved)})
+        if route != "/api/load":
             return self._json({"error": "not found"}, 404)
         try:
             n = int(self.headers.get("Content-Length") or 0)

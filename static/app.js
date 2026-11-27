@@ -119,6 +119,8 @@ const S = {
   chats: [], byId: new Map(), filter: "all", sort: "recent",
   search: null, q: "", currentId: null, chat: null, tree: null, sel: {},
   status: null,
+  view: store.get("ds_view") === "topics" ? "topics" : "date",
+  topics: null, tmap: new Map(), open: {}, topic: null,
 };
 const ROOT = "__root__";
 
@@ -151,24 +153,76 @@ function groupLabel(c) {
 }
 const PIN = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M16 3l5 5-3 1-4 4 .5 4.5-1.5 1.5-3.5-3.5L5 20l-1-1 4.5-4.5L5 11l1.5-1.5L11 10l4-4z"/></svg>';
 
-function renderList() {
-  const list = visibleChats(); const el = $("#list");
-  const bySearch = S.search ? new Map(S.search.map(r => [r.id, r])) : null;
-  let html = "", last = null;
-  for (const c of list) {
-    if (!bySearch && S.sort === "recent") { const g = groupLabel(c); if (g !== last) { html += `<div class="group">${esc(g)}</div>`; last = g; } }
-    const r = bySearch && bySearch.get(c.id);
-    let sub = "";
-    if (r && r.snippet) sub = `<div class="item-s">${esc(r.snippet.before)}<mark>${esc(r.snippet.match)}</mark>${esc(r.snippet.after)}</div>`;
-    else if (c.preview) sub = `<div class="item-s">${esc(c.preview)}</div>`;
-    html += `<button class="item${c.id === S.currentId ? " sel" : ""}" data-id="${esc(c.id)}" role="listitem">
+function itemHtml(c, r) {
+  let sub = "";
+  if (r && r.snippet) sub = `<div class="item-s">${esc(r.snippet.before)}<mark>${esc(r.snippet.match)}</mark>${esc(r.snippet.after)}</div>`;
+  else if (c.preview) sub = `<div class="item-s">${esc(c.preview)}</div>`;
+  return `<button class="item${c.id === S.currentId ? " sel" : ""}" data-id="${esc(c.id)}" role="listitem">
       <div class="item-t">${c.pinned ? PIN : ""}<span class="t">${esc(c.title)}</span></div>
       <div class="item-m"><span>${esc(fmtD(c.updated_at || c.inserted_at))}</span><span>${plural(c.message_count, "msg", "msgs")}</span>${r ? `<span>${plural(r.count, "ocorrência", "ocorrências")}</span>` : ""}</div>${sub}</button>`;
+}
+
+/* ---- temas ---- */
+const KIND_LABEL = { custom: "Meus temas", category: "Temas detectados", keyword: "Palavras-chave em comum" };
+function topicGroups() {
+  if (!S.topics) return [];
+  const pinnedOnly = S.filter === "pinned";
+  const ok = id => { const c = S.byId.get(id); return c && (!pinnedOnly || c.pinned); };
+  const key = c => c.updated_at || c.inserted_at || "";
+  const groups = S.topics.groups.map(g => ({ ...g, chats: g.chat_ids.filter(ok).map(id => S.byId.get(id)).sort((a, b) => key(b).localeCompare(key(a))) }));
+  const rank = { custom: 0, category: 1, keyword: 2 };
+  let out = groups.filter(g => g.kind === "custom" || g.chats.length).sort((a, b) => rank[a.kind] - rank[b.kind] || (a.kind === "custom" ? 0 : b.chats.length - a.chats.length || a.name.localeCompare(b.name)));
+  if (S.topic) out = out.filter(g => g.key === S.topic);
+  else {
+    const covered = new Set(); groups.filter(g => g.kind !== "keyword").forEach(g => g.chats.forEach(c => covered.add(c.id)));
+    const rest = S.chats.filter(c => ok(c.id) && !covered.has(c.id)).sort((a, b) => key(b).localeCompare(key(a)));
+    if (rest.length) out.push({ key: "none", kind: "none", name: "Sem tema", chats: rest });
   }
-  if (!list.length) html = `<div class="empty-list">${S.search ? "Nenhum chat encontrado." : S.filter === "pinned" ? "Nenhum chat fixado." : "Nenhum chat carregado."}</div>`;
-  el.innerHTML = html;
+  return out;
+}
+function renderTopicList() {
+  const groups = topicGroups(); let html = "", lastKind = null;
+  html += `<div class="topic-tools"><button class="btn ghost" data-act="new-topic">＋ Novo tema</button>${S.topic ? `<button class="btn ghost" data-act="clear-topic">Mostrar todos ✕</button>` : ""}</div>`;
+  for (const g of groups) {
+    if (g.kind !== lastKind && g.kind !== "none") { html += `<div class="group">${KIND_LABEL[g.kind]}</div>`; lastKind = g.kind; }
+    const open = S.topic ? true : (g.key in S.open ? S.open[g.key] : g.kind !== "keyword");
+    const label = g.kind === "keyword" ? "#" + g.name : g.name;
+    html += `<div class="tgroup${open ? " open" : ""}" data-key="${esc(g.key)}">
+      <div class="tg-head"><button class="tg-toggle" data-act="toggle" data-key="${esc(g.key)}"><span class="caret"></span><span class="tg-name">${esc(label)}</span><span class="tg-count">${g.chats.length}</span></button>
+      ${g.kind === "custom" ? `<button class="icon-btn sm" data-act="edit-topic" data-key="${esc(g.key)}" title="Editar tema">✎</button>` : ""}</div>
+      ${open ? `<div class="tg-body">${g.chats.length ? g.chats.map(c => itemHtml(c)).join("") : `<div class="empty-list sm">Nenhum chat neste tema ainda. Edite para adicionar palavras ou chats.</div>`}</div>` : ""}</div>`;
+  }
+  if (!groups.length || (groups.length === 1 && !groups[0].chats.length && groups[0].kind !== "custom")) html += `<div class="empty-list">Nenhum tema detectado.</div>`;
+  return html;
+}
+
+function renderList() {
+  const el = $("#list"); let html = "";
+  const bySearch = S.search ? new Map(S.search.map(r => [r.id, r])) : null;
+  const byTopic = S.view === "topics" && !bySearch;
+  document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("on", b.dataset.v === S.view));
+  $("#sortBtn").style.display = byTopic ? "none" : "";
+  if (byTopic) html = renderTopicList();
+  else {
+    const list = visibleChats(); let last = null;
+    for (const c of list) {
+      if (!bySearch && S.sort === "recent") { const g = groupLabel(c); if (g !== last) { html += `<div class="group">${esc(g)}</div>`; last = g; } }
+      html += itemHtml(c, bySearch && bySearch.get(c.id));
+    }
+    if (!list.length) html = `<div class="empty-list">${S.search ? "Nenhum chat encontrado." : S.filter === "pinned" ? "Nenhum chat fixado." : "Nenhum chat carregado."}</div>`;
+  }
+  const y = el.scrollTop; el.innerHTML = html; el.scrollTop = y;
   const total = S.chats.reduce((n, c) => n + c.message_count, 0);
   $("#stats").textContent = `${plural(S.chats.length, "chat", "chats")} · ${plural(total, "mensagem", "mensagens")}`;
+}
+
+/* ---- temas do chat aberto (chips no cabeçalho) ---- */
+function topicChips(id) {
+  if (!S.topics) return "";
+  const keys = S.topics.chat_topics[id] || []; const kws = (S.topics.chat_keywords[id] || []).slice(0, 5);
+  const chip = (k, label, cls) => `<button class="tchip ${cls}" data-act="goto-topic" data-key="${esc(k)}" title="Ver todos os chats deste tema">${esc(label)}</button>`;
+  return keys.map(k => { const g = S.tmap.get(k); return g ? chip(k, g.name, g.kind) : ""; }).join("") +
+    kws.map(w => S.tmap.has("kw:" + w) ? chip("kw:" + w, "#" + w, "keyword") : `<span class="tchip plain">#${esc(w)}</span>`).join("");
 }
 
 /* ============================ árvore de mensagens ============================ */
@@ -267,7 +321,8 @@ function renderChat(scrollTop = true) {
   $("#view").innerHTML = `
     <div class="chat-head"><div class="chat-head-in">
       <div><h1 class="chat-title">${esc(c.title || "(sem título)")}</h1>
-      <div class="chat-meta">${esc(fmtDT(c.inserted_at))} · ${plural(path.length, "mensagem", "mensagens")} (${plural(nUser, "pergunta", "perguntas")})${flags.length ? " · " + esc(flags.join(", ")) : ""}</div></div>
+      <div class="chat-meta">${esc(fmtDT(c.inserted_at))} · ${plural(path.length, "mensagem", "mensagens")} (${plural(nUser, "pergunta", "perguntas")})${flags.length ? " · " + esc(flags.join(", ")) : ""}</div>
+      <div class="tchips">${topicChips(c.id)}<button class="tchip add" data-act="edit-chat-topics" title="Adicionar este chat a um dos seus temas">＋ tema</button></div></div>
       <div class="chat-actions">
         <button class="btn ghost" id="procBtn" title="Expandir/recolher raciocínio e buscas">${store.get("ds_proc_open") === "1" ? "Recolher processo" : "Expandir processo"}</button>
         <button class="btn ghost" id="copyBtn">Copiar .md</button>
@@ -353,6 +408,7 @@ async function loadAll(openFirst = true) {
   $("#brandSub").textContent = S.status.user ? `DeepSeek · ${S.status.user}` : "DeepSeek · arquivo local";
   if (!S.status.loaded) { S.chats = []; renderList(); welcome(); return; }
   S.chats = await api("/api/chats"); S.byId = new Map(S.chats.map(c => [c.id, c]));
+  await loadTopics(false);
   renderList();
   const hash = decodeURIComponent(location.hash.slice(1));
   const target = S.byId.has(hash) ? hash : (S.chats.length === 1 && openFirst ? S.chats[0].id : null);
@@ -370,9 +426,83 @@ async function uploadZip(file) {
   } catch (e) { toast(e.message); }
 }
 
+async function loadTopics(rerender = true) {
+  try { S.topics = await api("/api/topics"); } catch { S.topics = { groups: [], chat_topics: {}, chat_keywords: {} }; }
+  S.tmap = new Map(S.topics.groups.map(g => [g.key, g]));
+  if (S.topic && !S.tmap.has(S.topic)) S.topic = null;
+  if (rerender) { renderList(); if (S.chat) { const y = $("#main").scrollTop; renderChat(false); $("#main").scrollTop = y; } }
+}
+
+/* ---- temas personalizados: modal de criar/editar ---- */
+const customList = () => (S.topics?.groups || []).filter(g => g.kind === "custom").map(g => ({ id: g.custom.id, name: g.name, keywords: g.custom.keywords, chats: g.custom.chats }));
+async function saveCustom(list) {
+  await api("/api/custom", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topics: list }) });
+  await loadTopics();
+}
+function openTopicDialog(key) {
+  const g = key ? S.tmap.get(key) : null; const cu = g ? g.custom : { id: null, keywords: [], chats: [] };
+  const dlg = $("#dlg"); const chosen = new Set(cu.chats);
+  dlg.innerHTML = `<form method="dialog" class="dlg-in" id="dlgForm">
+    <h2>${g ? "Editar tema" : "Novo tema"}</h2>
+    <label>Nome<input id="tName" maxlength="60" value="${esc(g ? g.name : "")}" placeholder="Ex.: Meu TCC, Receitas da família, Projeto X" required></label>
+    <label>Palavras que definem o tema <small>(separe por vírgula; o chat entra no tema se contiver qualquer uma delas)</small>
+      <input id="tKw" value="${esc(cu.keywords.join(", "))}" placeholder="Ex.: tcc, monografia, orientador"></label>
+    <div class="dlg-sub">Ou escolha chats manualmente</div>
+    <input id="tFilter" class="dlg-filter" placeholder="Filtrar chats…" type="search">
+    <div class="dlg-list" id="tChats">${S.chats.map(c => `<label class="dlg-row" data-t="${esc(fold(c.title))}"><input type="checkbox" value="${esc(c.id)}" ${chosen.has(c.id) ? "checked" : ""}><span>${esc(c.title)}</span></label>`).join("")}</div>
+    <div class="dlg-actions">${g ? `<button type="button" class="btn ghost danger" id="tDel">Excluir tema</button>` : ""}<span class="spacer"></span>
+      <button type="button" class="btn ghost" id="tCancel">Cancelar</button><button class="btn" id="tSave" value="ok">Salvar</button></div></form>`;
+  dlg.showModal();
+  $("#tName").focus();
+  $("#tFilter").addEventListener("input", e => { const q = fold(e.target.value); dlg.querySelectorAll(".dlg-row").forEach(r => r.style.display = r.dataset.t.includes(q) ? "" : "none"); });
+  $("#tCancel").onclick = () => dlg.close();
+  if (g) $("#tDel").onclick = async () => { if (!confirm(`Excluir o tema "${g.name}"? Os chats não são apagados.`)) return; try { await saveCustom(customList().filter(t => t.id !== cu.id)); if (S.topic === key) S.topic = null; renderList(); dlg.close(); toast("Tema excluído"); } catch (er) { toast(er.message); } };
+  $("#dlgForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const name = $("#tName").value.trim(); if (!name) return;
+    const item = {
+      id: cu.id, name, keywords: $("#tKw").value.split(",").map(s => s.trim()).filter(Boolean),
+      chats: [...dlg.querySelectorAll("#tChats input:checked")].map(i => i.value),
+    };
+    const list = customList(); const i = list.findIndex(t => t.id === cu.id);
+    if (i >= 0) list[i] = item; else list.push(item);
+    try { await saveCustom(list); S.view = "topics"; store.set("ds_view", "topics"); renderList(); dlg.close(); toast("Tema salvo"); } catch (er) { toast(er.message); }
+  });
+}
+/* menu rápido "＋ tema" do cabeçalho: marca/desmarca o chat aberto em cada tema personalizado */
+function openChatTopicsDialog() {
+  const custom = customList(); const id = S.currentId; const dlg = $("#dlg");
+  if (!custom.length) { openTopicDialog(null); return; }
+  dlg.innerHTML = `<form method="dialog" class="dlg-in"><h2>Temas deste chat</h2>
+    <div class="dlg-list tall">${custom.map(t => `<label class="dlg-row"><input type="checkbox" value="${esc(t.id)}" ${t.chats.includes(id) ? "checked" : ""}><span>${esc(t.name)}</span></label>`).join("")}</div>
+    <p class="dlg-hint">Chats também entram automaticamente num tema pelas palavras dele.</p>
+    <div class="dlg-actions"><button type="button" class="btn ghost" id="tNew">＋ Novo tema</button><span class="spacer"></span><button type="button" class="btn ghost" id="tCancel">Cancelar</button><button class="btn" value="ok">Salvar</button></div></form>`;
+  dlg.showModal();
+  $("#tCancel").onclick = () => dlg.close();
+  $("#tNew").onclick = () => { dlg.close(); openTopicDialog(null); };
+  dlg.querySelector("form").addEventListener("submit", async e => {
+    e.preventDefault();
+    const on = new Set([...dlg.querySelectorAll("input:checked")].map(i => i.value));
+    const list = customList().map(t => ({ ...t, chats: on.has(t.id) ? [...new Set([...t.chats, id])] : t.chats.filter(c => c !== id) }));
+    try { await saveCustom(list); dlg.close(); toast("Temas atualizados"); } catch (er) { toast(er.message); }
+  });
+}
+
 /* ============================ eventos ============================ */
 document.addEventListener("click", e => {
   const t = e.target;
+  const seg = t.closest("#seg button");
+  if (seg) { S.view = seg.dataset.v; store.set("ds_view", S.view); if (S.view === "date") S.topic = null; return renderList(); }
+  const act = t.closest("[data-act]");
+  if (act) {
+    const a = act.dataset.act, k = act.dataset.key;
+    if (a === "toggle") { const cur = S.tmap.get(k); const isOpen = k in S.open ? S.open[k] : cur?.kind !== "keyword"; S.open[k] = !isOpen; return renderList(); }
+    if (a === "new-topic") return openTopicDialog(null);
+    if (a === "edit-topic") return openTopicDialog(k);
+    if (a === "clear-topic") { S.topic = null; return renderList(); }
+    if (a === "goto-topic") { S.view = "topics"; store.set("ds_view", "topics"); S.topic = k; S.search = null; $("#q").value = ""; S.q = ""; renderList(); document.body.classList.add("nav"); return; }
+    if (a === "edit-chat-topics") return openChatTopicsDialog();
+  }
   const item = t.closest(".item"); if (item) return openChat(item.dataset.id);
   const chip = t.closest(".chip[data-f]");
   if (chip) { S.filter = chip.dataset.f; document.querySelectorAll(".chip[data-f]").forEach(c => c.classList.toggle("on", c === chip)); return renderList(); }
